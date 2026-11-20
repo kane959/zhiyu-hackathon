@@ -1,5 +1,16 @@
 (function App(){
 "use strict";
+// crypto.randomUUID only exists in a secure context (HTTPS or localhost).
+// On a plain http://IP page it is undefined and the match/reader flows throw.
+// getRandomValues works in every context, so fill in a v4-shaped UUID when needed.
+if(globalThis.crypto && !globalThis.crypto.randomUUID){
+  globalThis.crypto.randomUUID=()=>{
+    const b=globalThis.crypto.getRandomValues(new Uint8Array(16));
+    b[6]=(b[6]&0x0f)|0x40; b[8]=(b[8]&0x3f)|0x80;
+    const h=[...b].map(x=>x.toString(16).padStart(2,"0"));
+    return `${h.slice(0,4).join("")}-${h.slice(4,6).join("")}-${h.slice(6,8).join("")}-${h.slice(8,10).join("")}-${h.slice(10).join("")}`;
+  };
+}
 const root=document.querySelector("#root"),toast=document.querySelector("#toast");
 const esc=x=>String(x??"").replace(/[&<>"']/g,v=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[v]));
 const repo={get(k){try{return sessionStorage.getItem("zy:"+k)}catch{return null}},set(k,v){try{sessionStorage.setItem("zy:"+k,v)}catch{}},del(k){try{sessionStorage.removeItem("zy:"+k)}catch{}}};

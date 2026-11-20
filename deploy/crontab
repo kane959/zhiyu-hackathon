@@ -1,0 +1,33 @@
+# Zhiyu scheduled jobs.
+#
+# Install as the service user (this replaces that user's whole crontab, so keep
+# this file as the single source of truth):
+#
+#   sudo crontab -u zhiyu deploy/crontab
+#   sudo crontab -u zhiyu -l          # verify
+#
+# The scripts are called by path, which is why they must keep their exec bit;
+# preflight A7 checks exactly that.
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+TZ=Asia/Shanghai
+MAILTO=""
+
+# 03:00 daily backup, WAL-safe .backup plus an integrity check of the copy.
+0 3 * * * /srv/zhiyu/app/scripts/backup.sh >> /srv/zhiyu/var/backup.log 2>&1
+
+# Every five minutes: probe /api/health. Quiet until three probes in a row fail,
+# then one alert, then one recovery notice. Point --url at the public address so
+# a broken reverse proxy or certificate also counts as down.
+#
+# Replace the host before installing. Without a notification channel the alert
+# only lands in watch.log and watch.out, which nobody reads at 03:00 — add
+# --notify /srv/zhiyu/var/notify.sh once the team has a webhook (see RUNBOOK).
+*/5 * * * * /srv/zhiyu/app/scripts/watch.sh --url https://zhiyu.example.com/api/health >> /srv/zhiyu/var/watch.out 2>&1
+
+# Sunday 04:10: PRAGMA integrity_check on the live database.
+10 4 * * 0 /srv/zhiyu/app/scripts/watch.sh --integrity >> /srv/zhiyu/var/watch.out 2>&1
+
+# Sunday 04:30: drop match runs past the retention window. Never touches a run
+# behind a published card, and never touches visits or feedback.
+30 4 * * 0 /srv/zhiyu/app/scripts/prune.py --apply >> /srv/zhiyu/var/prune.log 2>&1

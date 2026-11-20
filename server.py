@@ -19,7 +19,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from fixtures import EXAMPLE, SOURCES, rank
+from fixtures import EXAMPLE, SOURCES
+from matcher import run as match_run
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get("ZHIYU_DB", ROOT / "var" / "zhiyu.sqlite3"))
@@ -129,6 +130,8 @@ CREATE TABLE IF NOT EXISTS cards(
   data TEXT NOT NULL,
   active INTEGER NOT NULL DEFAULT 1,
   published_at INTEGER NOT NULL DEFAULT 0,
+  run_id TEXT NOT NULL DEFAULT '',
+  candidate_id TEXT NOT NULL DEFAULT '',
   UNIQUE(pid, version)
 );
 CREATE TABLE IF NOT EXISTS visits(
@@ -167,7 +170,11 @@ CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT NOT NULL);
 EXTRA_COLUMNS = {
     "projects": [("created_at", "INTEGER NOT NULL DEFAULT 0"), ("updated_at", "INTEGER NOT NULL DEFAULT 0")],
     "runs": [("created_at", "INTEGER NOT NULL DEFAULT 0")],
-    "cards": [("published_at", "INTEGER NOT NULL DEFAULT 0")],
+    "cards": [
+        ("published_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("run_id", "TEXT NOT NULL DEFAULT ''"),
+        ("candidate_id", "TEXT NOT NULL DEFAULT ''"),
+    ],
     "visits": [("first_seen", "INTEGER NOT NULL DEFAULT 0"), ("opened_at", "INTEGER")],
 }
 
@@ -201,6 +208,31 @@ def migrate(conn):
         conn.execute(statement)
 
 
+def prune(days=None, dry_run=False):
+    """Drop match runs that are old and not referenced by any published card.
+
+    `runs` is the only table that grows without a deliberate user action: every
+    match request stores a full candidate list plus a project snapshot. Runs that
+    a card points at are kept forever, because `cards.run_id` is the only path
+    from a reader's feedback back to the candidates they were shown.
+
+    Visits and feedback are never pruned: they are the numbers the results board
+    reports, and deleting rows would silently rewrite past totals.
+    """
+    limit = max(1, int(days if days is not None else env_int("ZHIYU_RUN_RETENTION_DAYS", 90)))
+    cutoff = now() - limit * 86400
+    stale = "created_at<? AND id NOT IN (SELECT run_id FROM cards WHERE run_id<>'')"
+    with closing(sqlite3.connect(DB, timeout=8)) as conn:
+        candidates = conn.execute(f"SELECT count(*) FROM runs WHERE {stale}", (cutoff,)).fetchone()[0]
+        total = conn.execute("SELECT count(*) FROM runs").fetchone()[0]
+        if dry_run or not candidates:
+            return dict(days=limit, cutoff=cutoff, candidates=candidates, deleted=0, remaining=total, dryRun=dry_run)
+        conn.execute("BEGIN IMMEDIATE")
+        deleted = conn.execute(f"DELETE FROM runs WHERE {stale}", (cutoff,)).rowcount
+        conn.commit()
+    return dict(days=limit, cutoff=cutoff, candidates=candidates, deleted=deleted, remaining=total - deleted, dryRun=False)
+
+
 def init():
     DB.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(DB)) as conn, conn:
@@ -221,24 +253,55 @@ def seed_demo():
     with closing(connect_live()) as conn, conn:
         if conn.execute("SELECT 1 FROM meta WHERE k='demo_owner'").fetchone():
             return
-        owner, pid, slug = uid(), uid(), uid()
+        owner, pid, slug, run_id = uid(), uid(), uid(), uid()
         stamp = now()
-        conn.execute("INSERT INTO projects VALUES(?,?,?,?,?)", (pid, owner, pack(EXAMPLE), stamp, stamp))
+        conn.execute(
+            "INSERT INTO projects(id,owner,data,created_at,updated_at) VALUES(?,?,?,?,?)",
+            (pid, owner, pack(EXAMPLE), stamp, stamp),
+        )
+        # A demo card must trace back to a run, otherwise the dashboard shows a card
+        # whose origin is empty and the match page has nothing to open.
+        outcome = match_run(EXAMPLE, "synthetic")
+        conn.execute(
+            "INSERT INTO runs(id,pid,rid,data,created_at) VALUES(?,?,?,?,?)",
+            (
+                run_id,
+                pid,
+                "demo-1",
+                pack(
+                    dict(
+                        runId=run_id,
+                        requestId="demo-1",
+                        mode="synthetic",
+                        status=outcome["status"],
+                        errorCode=outcome["errorCode"],
+                        candidates=outcome["candidates"],
+                        projectSnapshot=EXAMPLE,
+                    )
+                ),
+                stamp,
+            ),
+        )
+        chosen = next((item for item in outcome["candidates"] if item["judgment"] == "适配"), None)
         card = dict(
             slug=slug,
             version=1,
             title="用拾句核对访谈原话",
             material="一段脱敏的中文访谈文字稿",
-            steps="1. 打开示例工具\n2. 找出三句候选原话\n3. 回到逐字稿逐句核对",
+            steps="打开示例工具\n找出三句候选原话\n回到逐字稿逐句核对",
             criterion="三句都能在原稿定位，并能说明哪一句不能支持结论",
             question="哪一句原话不能支持你的结论？",
             tool=EXAMPLE["name"],
             url=EXAMPLE["url"],
-            scene="整理访谈时，怎样找到能支撑结论的原话？",
+            scene=chosen["title"] if chosen else "整理访谈时，怎样找到能支撑结论的原话？",
             mode="synthetic",
         )
         signature = hashlib.sha256(pack([pid, "demo"]).encode()).hexdigest()
-        conn.execute("INSERT INTO cards VALUES(?,?,?,?,?,?,?)", (slug, pid, 1, signature, pack(card), 1, stamp))
+        conn.execute(
+            "INSERT INTO cards(slug,pid,version,signature,data,active,published_at,run_id,candidate_id) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (slug, pid, 1, signature, pack(card), 1, stamp, run_id, chosen["id"] if chosen else ""),
+        )
         rows = [
             ("done", "", "三句都找到了。第二句讲的是时间安排，不能支持结论。"),
             ("blocked", "核对第三句", "候选句来自另一段访谈，找不到上下文。"),
@@ -292,6 +355,10 @@ def tool_url(value):
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Zhiyu/1"
+
+    def version_string(self):
+        # Do not advertise the interpreter version in every response.
+        return self.server_version
 
     def log_message(self, *args):
         pass
@@ -390,11 +457,50 @@ class Handler(BaseHTTPRequestHandler):
                 READ_WINDOWS.pop(stale, None)
         ck(READ_WINDOWS[key] <= rate_cap("read"), 429, "请求过于频繁，请稍后重试。")
 
+    def drain_body(self):
+        """Consume an unread request body before replying with an early 4xx.
+
+        Without this the server answers while the client is still writing a
+        large body. On real networks that socket can be reset before the
+        response lands, so the client sees IncompleteRead instead of the
+        intended 413/415/403. Read at most 1 MiB so a bogus Content-Length
+        cannot pin a worker; give up and close the connection past that.
+        """
+        if getattr(self, "_body_consumed", True):
+            return
+        self._body_consumed = True
+        try:
+            remaining = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self.close_connection = True
+            return
+        if remaining <= 0:
+            return
+        target = min(remaining, 1024 * 1024)
+        previous = self.connection.gettimeout()
+        try:
+            self.connection.settimeout(2)
+            while target > 0:
+                block = self.rfile.read(min(64 * 1024, target))
+                if not block:
+                    break
+                target -= len(block)
+        except OSError:
+            self.close_connection = True
+        finally:
+            try:
+                self.connection.settimeout(previous)
+            except OSError:
+                pass
+        if target > 0:
+            self.close_connection = True
+
     # --- entry points ------------------------------------------------------
 
     def handle_req(self, post=False):
         self.pending = []
         self.started = time.time()
+        self._body_consumed = not post
         try:
             host = self.headers.get("Host", "")
             ck(host.split(":")[0].lower() in allowed_hosts(), 403, "当前访问地址不在允许的域名列表内。")
@@ -408,6 +514,7 @@ class Handler(BaseHTTPRequestHandler):
                 ck(self.headers.get_content_type() == "application/json", 415, "需要 JSON 请求。")
                 length = int(self.headers.get("Content-Length", "0"))
                 ck(0 < length <= 24000, 413, "请求内容过大或为空。")
+                self._body_consumed = True
                 payload = json.loads(self.rfile.read(length))
                 ck(isinstance(payload, dict), 400, "请求格式不正确。")
             elif not path.startswith("/api/"):
@@ -431,6 +538,7 @@ class Handler(BaseHTTPRequestHandler):
                     data = self.api(conn, path, payload, post)
             self.respond(200, data)
         except Problem as exc:
+            self.drain_body()
             self.respond(exc.code, {"error": exc.msg})
         except (ValueError, UnicodeError):
             self.respond(400, {"error": "请求格式不正确。"})
@@ -520,30 +628,70 @@ class Handler(BaseHTTPRequestHandler):
             project = self.own(conn, pid)
 
             if len(seg) == 3 and not post:
-                row = conn.execute("SELECT data FROM runs WHERE pid=? ORDER BY rowid DESC LIMIT 1", (pid,)).fetchone()
+                row = conn.execute(
+                    "SELECT data FROM runs WHERE pid=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (pid,)
+                ).fetchone()
                 cards = [
-                    dict(**json.loads(data), active=bool(active))
-                    for data, active in conn.execute(
-                        "SELECT data,active FROM cards WHERE pid=? ORDER BY version DESC", (pid,)
+                    dict(
+                        **json.loads(data),
+                        active=bool(active),
+                        publishedAt=published,
+                        runId=run_id,
+                        candidateId=candidate_id,
+                    )
+                    for data, active, published, run_id, candidate_id in conn.execute(
+                        "SELECT data,active,published_at,run_id,candidate_id FROM cards "
+                        "WHERE pid=? ORDER BY version DESC",
+                        (pid,),
                     )
                 ]
                 return dict(project=project, run=json.loads(row[0]) if row else None, cards=cards)
 
+            if seg[3:] == ["runs"] and not post:
+                # Version history of the drafts, newest first. Candidate bodies are omitted:
+                # a list is for picking a run to look at, not for shipping them all.
+                items = []
+                for run_id, data, created in conn.execute(
+                    "SELECT id,data,created_at FROM runs WHERE pid=? ORDER BY created_at DESC,rowid DESC LIMIT 50",
+                    (pid,),
+                ):
+                    run = json.loads(data)
+                    items.append(
+                        dict(
+                            runId=run_id,
+                            requestId=run.get("requestId"),
+                            mode=run.get("mode"),
+                            status=run.get("status"),
+                            errorCode=run.get("errorCode"),
+                            candidateCount=len(run.get("candidates") or []),
+                            createdAt=created,
+                        )
+                    )
+                return dict(runs=items)
+
             if seg[3:] == ["runs"] and post:
                 rid = fields(body, ["requestId"], 100)["requestId"]
-                row = conn.execute("SELECT data FROM runs WHERE pid=? AND rid=?", (pid, rid)).fetchone()
-                if row:
-                    return json.loads(row[0])
                 mode = body.get("mode", "synthetic")
                 ck(mode in ("synthetic", "live"), 400, "未知模式。")
-                items = rank(project) if mode == "synthetic" else []
+                row = conn.execute("SELECT data FROM runs WHERE pid=? AND rid=?", (pid, rid)).fetchone()
+                if row:
+                    cached = json.loads(row[0])
+                    # Replaying a requestId must not change the answer: otherwise switching
+                    # to live mode would silently return the older synthetic result.
+                    ck(
+                        cached.get("mode") == mode,
+                        409,
+                        "该 requestId 已用于另一种模式，请更换 requestId 后重试。",
+                    )
+                    return cached
+                outcome = match_run(project, mode)
                 run = dict(
                     runId=uid(),
                     requestId=rid,
                     mode=mode,
-                    status=("success" if items else "empty") if mode == "synthetic" else "failed",
-                    errorCode=None if mode == "synthetic" else "not_configured",
-                    candidates=items,
+                    status=outcome["status"],
+                    errorCode=outcome["errorCode"],
+                    candidates=outcome["candidates"],
                     projectSnapshot=project,
                 )
                 conn.execute(
@@ -584,8 +732,18 @@ class Handler(BaseHTTPRequestHandler):
                     mode=run["mode"],
                 )
                 conn.execute(
-                    "INSERT INTO cards(slug,pid,version,signature,data,active,published_at) VALUES(?,?,?,?,?,1,?)",
-                    (snapshot["slug"], pid, snapshot["version"], signature, pack(snapshot), now()),
+                    "INSERT INTO cards(slug,pid,version,signature,data,active,published_at,run_id,candidate_id) "
+                    "VALUES(?,?,?,?,?,1,?,?,?)",
+                    (
+                        snapshot["slug"],
+                        pid,
+                        snapshot["version"],
+                        signature,
+                        pack(snapshot),
+                        now(),
+                        run["runId"],
+                        draft["candidateId"],
+                    ),
                 )
                 return snapshot
 
@@ -596,8 +754,8 @@ class Handler(BaseHTTPRequestHandler):
 
             if seg[3:] == ["results"] and not post:
                 blocks = []
-                for slug, version in conn.execute(
-                    "SELECT slug,version FROM cards WHERE pid=? ORDER BY version DESC", (pid,)
+                for slug, version, active, published in conn.execute(
+                    "SELECT slug,version,active,published_at FROM cards WHERE pid=? ORDER BY version DESC", (pid,)
                 ):
                     visits, opened = conn.execute(
                         "SELECT count(*),coalesce(sum(opened),0) FROM visits WHERE slug=?", (slug,)
@@ -613,6 +771,8 @@ class Handler(BaseHTTPRequestHandler):
                         dict(
                             slug=slug,
                             version=version,
+                            active=bool(active),
+                            publishedAt=published,
                             visits=visits,
                             opened=opened,
                             completed=sum(item["status"] == "done" for item in rows),
@@ -647,13 +807,28 @@ class Handler(BaseHTTPRequestHandler):
                         400,
                         "请注明卡住的步骤。",
                     )
+                    previous = conn.execute(
+                        "SELECT sid,status FROM feedback WHERE slug=? AND reader=?", (slug, reader)
+                    ).fetchone()
+                    # A second answer under a new submissionId must not be dropped
+                    # silently: inserting would be ignored by the primary key while
+                    # the caller still receives 200, so the reader believes the new
+                    # answer was recorded and the board keeps showing the old one.
+                    ck(
+                        previous is None or previous[0] == item["submissionId"],
+                        409,
+                        "这张卡片已提交过反馈，不能再次提交。",
+                    )
                     conn.execute(
                         "INSERT OR IGNORE INTO feedback VALUES(?,?,?,?,?,?,?)",
                         (slug, reader, item["submissionId"], item["status"], item["step"], item["note"], now()),
                     )
                 receipt = conn.execute("SELECT sid,status FROM feedback WHERE slug=? AND reader=?", (slug, reader)).fetchone()
                 if seg[3] == "feedback":
-                    ck(receipt, 409, "提交 ID 已使用，请刷新后重试。")
+                    # Reaching here without a row means the id collided with another
+                    # reader's submission; the insert was ignored, so say so instead
+                    # of returning an empty receipt as success.
+                    ck(receipt, 409, "提交 ID 已被其他会话使用，请刷新后重试。")
                 return dict(receipt=dict(submissionId=receipt[0], status=receipt[1]) if receipt else None)
 
         raise Problem(404, "接口不存在。")
@@ -668,20 +843,24 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=env_int("ZHIYU_PORT", 4173))
+    parser.add_argument("--host", default=env("ZHIYU_HOST", "127.0.0.1"),
+                        help="监听地址。默认只听回环，前面由 Caddy/nginx 反代；"
+                             "需要同网段直连时改成 0.0.0.0，并把该网段写进 ZHIYU_HOSTS。")
     parser.add_argument("--open", action="store_true")
     args = parser.parse_args()
+    shown = "127.0.0.1" if args.host in ("0.0.0.0", "::", "") else args.host
     init()
     if env_flag("ZHIYU_DEMO"):
         seed_demo()
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+        server = ThreadingHTTPServer((args.host, args.port), Handler)
     except OSError as exc:
         if args.open:
             import urllib.request
             import webbrowser
 
             try:
-                base = f"http://127.0.0.1:{args.port}"
+                base = f"http://{shown}:{args.port}"
                 with urllib.request.urlopen(base + "/api/workspace", timeout=2) as resp:
                     same = json.load(resp).get("example") == EXAMPLE
                 if same:
@@ -693,8 +872,8 @@ def main():
     if args.open:
         import webbrowser
 
-        webbrowser.open(f"http://127.0.0.1:{server.server_port}/")
-    print(f"Zhiyu: http://127.0.0.1:{server.server_port}/ build={build_id()}", flush=True)
+        webbrowser.open(f"http://{shown}:{server.server_port}/")
+    print(f"Zhiyu: http://{shown}:{server.server_port}/ build={build_id()}", flush=True)
     server.serve_forever()
 
 

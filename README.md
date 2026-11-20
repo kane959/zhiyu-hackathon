@@ -14,6 +14,8 @@ python server.py --open
 
 默认地址 http://127.0.0.1:4173/ 。请始终使用同一主机名与开发者浏览器，localhost 与 127.0.0.1 的 Cookie 不共享。端口冲突可用 `python server.py --port 4180 --open`。用 Ctrl+C 停止服务。直接双击 HTML 或使用静态服务器无法调用接口。
 
+要让同一网段的手机访问本机实例：`python server.py --host 0.0.0.0 --port 4199`，同时把手机要用的那个 IP 加进 `ZHIYU_HOSTS`（否则每个请求都 403）。明文 HTTP 下原生 `crypto.randomUUID()` 不可用，但 `app.js` 顶部已加兜底，点示例按钮不会报错（详见 `docs/DEPLOY.md` 第 1 节）。注意静态资源缓存 5 分钟，改过前端后手机要强刷才生效。
+
 1. 在工作台点 **试跑访谈稿示例**。示例工具“拾句”接收脱敏的文字访谈稿；对照两个场景的证据，查看为何推荐核对引文、排除音频转写。也可登记自己的工具。
 2. 在适配场景点 **选这个场景做卡片**。编辑材料、步骤、完成标准及反馈问题，预览并发布。发布是保存到本机，不会发帖。
 3. 打开版本化的读者链接，也可复制到同一台机器的另一浏览器。点 **打开原工具试用**，可在示例工具内查找、定位候选原话；切回卡片，选“做完了”或“卡住了”，回答该卡的问题。
@@ -37,7 +39,7 @@ python server.py --open
 $env:ZHIYU_DEMO='1'; python server.py --open
 ```
 
-首次启动会写入一个示例项目、一张已发布卡片和两条反馈，恢复码保存在 `var/DEMO_CODE`（权限 600，不进 Git）。删除数据库并重启会重新生成。
+首次启动会写入一个示例项目、一次匹配运行、一张已发布卡片和两条反馈，恢复码保存在 `var/DEMO_CODE`（权限 600，不进 Git）。删除数据库并重启会重新生成。
 
 ## 部署与运维
 
@@ -49,6 +51,8 @@ $env:ZHIYU_DEMO='1'; python server.py --open
 | 数据模型与迁移 | `docs/DATA.md` |
 | 进程与反向代理 | `deploy/zhiyu.service`、`deploy/Caddyfile`、`deploy/nginx.conf` |
 | 备份与恢复演练 | `scripts/backup.sh`、`scripts/restore-check.sh` |
+| 探活告警与定时任务 | `scripts/watch.sh`、`deploy/crontab` |
+| 部署预检（主机上一条命令查 43 项，只读） | `scripts/preflight.sh` |
 | 并发基准 | `scripts/bench.py` |
 | 黑盒验收 | `scripts/accept.py`，判读方法见 `docs/验收.md` |
 
@@ -58,16 +62,17 @@ $env:ZHIYU_DEMO='1'; python server.py --open
 | --- | --- | --- |
 | F1 开发者工作台 | app.js 的 home / edit / match / cardEditor | 用实际工具和长文本复核；可在侧栏链接 `/recover` |
 | F2 读者与看板 | drawReader / feedbackForm / dashboard | 开展手机真人试用 |
-| B1 场景筛选 | fixtures.py 的 SOURCES / rank | 接官方授权检索和模型；保留真实证据与失败状态 |
+| B1 场景筛选 | `matcher.py` 的 `run()`（当前委托 `fixtures.rank`） | 替换 `run()` 实现接官方授权检索和模型；保留真实证据与失败状态，契约见文件头与 `test_matcher.py` |
 | B2 数据与发布 | server.py、API.md、docs/、deploy/、scripts/ | 等 P 提供主机与域名后执行部署 |
 | P 产品验证 | 上面的四步脚本 | 获取真实授权样本和试用反馈，核对站内分享入口 |
 
 接口与三类匹配样例见 [API.md](API.md)。测试使用临时数据库与独立 Cookie，不写工作区的实际数据：
 
 ```powershell
-python -m unittest -v test_flow test_deploy   # 14 组单元与集成
-python scripts/accept.py                      # 27 项黑盒验收，含 403/413/429 边界
+python -m unittest -v test_flow test_deploy test_matcher test_publish test_events test_frontend_contract   # 65 组单元、集成与契约测试
+python scripts/accept.py                      # 30 项黑盒验收，含 403/413/429 边界
 python scripts/accept.py --base https://域名   # 对线上地址复核，会留下测试数据
+python scripts/prune.py                       # 匹配运行留存报告，--apply 才删
 ```
 
 验收的判读标准见 [docs/验收.md](docs/验收.md)。
