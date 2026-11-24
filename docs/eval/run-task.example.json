@@ -1,0 +1,9 @@
+{
+  "schema": "zhiyu-eval/v1",
+  "kind": "run",
+  "label": "task-order",
+  "note": "示例：任务重排。B1 按任务相关度重排后替换；应把人工判为适配的 interview 提到首位。",
+  "projects": {
+    "demo-pickup": ["interview", "transcribe", "schedule"]
+  }
+}

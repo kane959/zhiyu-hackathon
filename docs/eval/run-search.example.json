@@ -1,0 +1,9 @@
+{
+  "schema": "zhiyu-eval/v1",
+  "kind": "run",
+  "label": "search-order",
+  "note": "示例：搜索原序。B1 用真实检索的原顺序替换。数组顺序即展示顺序。",
+  "projects": {
+    "demo-pickup": ["transcribe", "schedule", "interview"]
+  }
+}

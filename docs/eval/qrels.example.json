@@ -1,0 +1,12 @@
+{
+  "schema": "zhiyu-eval/v1",
+  "kind": "qrels",
+  "note": "示例人工标签。P1/P3 交付时按此格式替换 projects；候选 id 与 fixtures.py 的 SOURCES 对齐。等级 2=适配 1=待核实 0=排除。",
+  "projects": {
+    "demo-pickup": {
+      "interview": 2,
+      "transcribe": 0,
+      "schedule": 0
+    }
+  }
+}

@@ -1,5 +1,5 @@
 """Functional tests over actual HTTP using an isolated SQLite file and cookie jars."""
-import http.cookiejar, json, tempfile, threading, unittest, urllib.request, urllib.error
+import http.cookiejar, json, socket, tempfile, threading, unittest, urllib.request, urllib.error
 from pathlib import Path
 import server
 from fixtures import EXAMPLE
@@ -57,5 +57,29 @@ class Flow(unittest.TestCase):
         self.assertEqual(self.owner.call("workspace")["projects"][0]["task"],EXAMPLE["task"]);self.assertEqual(self.other.call("workspace")["projects"],[])
         self.err(400,self.owner.call,"projects",dict(EXAMPLE,url="data:text/plain,no"))
         self.assertTrue(server.DB.is_file());server.init();self.assertEqual(self.owner.call(self.path)["project"]["name"],EXAMPLE["name"])
+    def test_early_4xx_consumes_large_body(self):
+        # A 512 KiB body exceeds the loopback socket buffers, so an early
+        # 413/415 that replies without reading the body resets the connection
+        # and the client gets IncompleteRead instead of the status code.
+        def send(headers):
+            req=urllib.request.Request(self.base+"/api/projects",data=b"x"*(512*1024),headers=headers)
+            with self.assertRaises(urllib.error.HTTPError) as caught:self.owner.agent.open(req,timeout=10)
+            self.assertEqual(caught.exception.code,expect);caught.exception.close()
+        expect=413;send({"Content-Type":"application/json"})
+        expect=415;send({"Content-Type":"text/plain"})
+        # Raw socket proves the body is consumed before the early error is
+        # written: with the old code the 413 arrives while only 100 of the
+        # declared 30000 bytes have been sent.
+        with socket.create_connection(("127.0.0.1",self.host.server_port),timeout=5) as sock:
+            head=(f"POST /api/projects HTTP/1.1\r\nHost: 127.0.0.1:{self.host.server_port}\r\n"
+                  "Content-Type: application/json\r\nContent-Length: 30000\r\n\r\n").encode()
+            sock.sendall(head+b"x"*100)
+            sock.settimeout(0.4)
+            try:early=sock.recv(64)
+            except socket.timeout:early=b""
+            self.assertFalse(early,"服务端未读完请求体就提前返回错误")
+            sock.settimeout(5)
+            sock.sendall(b"x"*(30000-100))
+            self.assertIn(b" 413 ",sock.recv(256).split(b"\r\n")[0])
 
 if __name__=="__main__":unittest.main(verbosity=2)
