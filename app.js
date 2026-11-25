@@ -79,8 +79,9 @@ function cardEditor(cid){
  const d=saved||defaultDraft(current(),c);
  return head("编辑试用卡","写清楚读者带什么、做什么，以及怎样判断有用。",link("返回匹配",href("match")))+`<div class="grid"><form id="card-edit" class="box" data-cid="${esc(cid)}"><div class="formgrid">${field("title","卡片标题",d.title,false,true)}${field("material","所需材料",d.material,true,true)}${field("steps","试用步骤（每行一步）",d.steps,true,true)}${field("criterion","完成标准",d.criterion,true,true)}${field("question","想听读者回答的问题",d.question,true,true)}</div><div class="tools form-end"><button>预览试用卡</button></div></form><aside class="box quietbox"><h2>选中的场景</h2><p>${esc(c.title)}</p><blockquote class="source">${esc(c.evidence)}</blockquote><p class="small">合成样例 · 试用材料直接在原工具处理。</p></aside></div>`;
 }
-function cardBody(c){
- return `<div class="row spread"><b>${esc(c.tool)}</b><span class="sample-label">${c.version?"试用卡 v"+c.version:"发布前预览"} · 合成场景</span></div><h1>${esc(c.title)}</h1><p class="small">适用场景：${esc(c.scene)}</p><hr class="sep"><h2>带什么</h2><p class="copy">${esc(c.material)}</p><div class="band"><h2>怎么试</h2><ol class="process">${c.steps.split(/\r?\n/).filter(x=>x.trim()).map(x=>`<li>${esc(x)}</li>`).join("")}</ol></div><div class="box quietbox"><h3>做到什么算完成</h3><p class="copy">${esc(c.criterion)}</p></div>`;
+function cardBody(c,mode=c.mode){
+ const sceneType=mode==="live"?"真实场景":"合成场景";
+ return `<div class="row spread"><b>${esc(c.tool)}</b><span class="sample-label">${c.version?"试用卡 v"+c.version:"发布前预览"} · ${sceneType}</span></div><h1>${esc(c.title)}</h1><p class="small">适用场景：${esc(c.scene)}</p><hr class="sep"><h2>带什么</h2><p class="copy">${esc(c.material)}</p><div class="band"><h2>怎么试</h2><ol class="process">${c.steps.split(/\r?\n/).filter(x=>x.trim()).map(x=>`<li>${esc(x)}</li>`).join("")}</ol></div><div class="box quietbox"><h3>做到什么算完成</h3><p class="copy">${esc(c.criterion)}</p></div>`;
 }
 function published(slug){
  const c=detail?.cards.find(x=>x.slug===slug);if(!c)return head("找不到这个版本","回到场景页查看已发布版本。",link("查看场景",href("match")));
@@ -90,12 +91,16 @@ function published(slug){
 function dashboard(data,filter){
  if(!detail)return head("读者反馈","分别查看访问、进入工具和自报完成。")+prep();
  const vs=data.versions,blocks=filter?vs.filter(c=>c.slug===filter):vs;
+ const versionOptions=vs.map(v=>{
+  const status=v.active?"":" · 已撤回";
+  return `<option value="${v.slug}" ${filter===v.slug?"selected":""}>v${v.version}${status}</option>`;
+ }).join("");
  const stats=[["卡片访问",blocks.reduce((s,x)=>s+x.visits,0)],["进入工具",blocks.reduce((s,x)=>s+x.opened,0)],["自报完成",blocks.reduce((s,x)=>s+x.completed,0)],["具体反馈",blocks.reduce((s,x)=>s+x.feedback.length,0)]];
  const rows=blocks.flatMap(c=>c.feedback.map(x=>({...x,version:c.version}))).sort((a,b)=>b.at-a.at);
- return head("读者反馈",current().name,selectedProject())+`<section class="box"><div class="row spread"><h2>试用记录</h2><label class="small">卡片版本 <select id="version"><option value="">全部版本</option>${vs.map(v=>`<option value="${v.slug}" ${filter===v.slug?"selected":""}>v${v.version}</option>`).join("")}</select></label></div><dl class="stats">${stats.map(([l,n])=>`<div><dt>${l}</dt><dd>${n}</dd></div>`).join("")}</dl><p class="small">${ws.demoWorkspace?"这是演示工作区，初始有 2 次合成访问及反馈。 ":""}每个读者浏览器会话在同一版本只计一次。进入工具只计点击，完成须由读者自己提交。</p></section><section class="box"><h2>反馈原文</h2>${rows.length?rows.map(x=>`<article class="entry">${tag(x.status==="done"?"自报做完":"卡住了",x.status==="done"?"":"no")} <span class="small">v${x.version} · ${esc(new Date(x.at*1000).toLocaleString("zh-CN"))}</span>${x.step?`<p>卡住的位置：${esc(x.step)}</p>`:""}<p class="verbatim">${esc(x.note)}</p></article>`).join(""):`<p class="empty">这个范围内还没有反馈。发布卡片后，让读者从读者页填写。</p>`}</section>`;
+ return head("读者反馈",current().name,selectedProject())+`<section class="box"><div class="row spread"><h2>试用记录</h2><label class="small">卡片版本 <select id="version"><option value="">全部版本</option>${versionOptions}</select></label></div><dl class="stats">${stats.map(([l,n])=>`<div><dt>${l}</dt><dd>${n}</dd></div>`).join("")}</dl><p class="small">${ws.demoWorkspace?"这是演示工作区，初始有 2 次合成访问及反馈。 ":""}每个读者浏览器会话在同一版本只计一次。进入工具只计点击，完成须由读者自己提交。</p></section><section class="box"><h2>反馈原文</h2>${rows.length?rows.map(x=>`<article class="entry">${tag(x.status==="done"?"自报做完":"卡住了",x.status==="done"?"":"no")} <span class="small">v${x.version} · ${esc(new Date(x.at*1000).toLocaleString("zh-CN"))}</span>${x.step?`<p>卡住的位置：${esc(x.step)}</p>`:""}<p class="verbatim">${esc(x.note)}</p></article>`).join(""):`<p class="empty">这个范围内还没有反馈。发布卡片后，让读者从读者页填写。</p>`}</section>`;
 }
 function showPreview(){
- root.innerHTML=shell("card",head("预览试用卡","确认以下内容可以交给读者，再发布这个版本。")+`<section class="public-sheet">${cardBody(editing)}<hr class="sep"><h3>反馈问题</h3><p>${esc(editing.question)}</p><div class="tools form-end">${btn("确认发布","publish")}${btn("继续编辑","back-edit","secondary")}</div></section>`);window.scrollTo(0,0)
+ root.innerHTML=shell("card",head("预览试用卡","确认以下内容可以交给读者，再发布这个版本。")+`<section class="public-sheet">${cardBody(editing,detail.run.mode)}<hr class="sep"><h3>反馈问题</h3><p>${esc(editing.question)}</p><div class="tools form-end">${btn("确认发布","publish")}${btn("继续编辑","back-edit","secondary")}</div></section>`);window.scrollTo(0,0)
 }
 function feedbackForm(){
  if(receipt)return `<div class="notice" role="status"><strong>反馈已收到 · ${receipt.status==="done"?"做完了":"卡住了"}</strong><p>已归入 v${reader.version}。刷新页面也不会重复提交。</p></div>`;
